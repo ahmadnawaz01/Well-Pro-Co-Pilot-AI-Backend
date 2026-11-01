@@ -18,3 +18,5 @@ uvicorn==0.54.0
 email-validator
 email-validator
 pydantic-settings
+langchain
+langchain-google-genai
