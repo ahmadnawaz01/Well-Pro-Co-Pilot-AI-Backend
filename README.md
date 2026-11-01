@@ -234,6 +234,18 @@ flowchart TD
 
 ## 🌐 API Reference
 
+> 📘 **Full API Specification & JSON Schemas**: For detailed input/output JSON schemas, request envelopes, and field tables, see [FASTAPI_ENDPOINTS_GUIDE.md](FASTAPI_ENDPOINTS_GUIDE.md).
+
+### Endpoint Categories:
+- **🔐 Authentication** (/api/v1/auth): Signup, Login, Verify Session
+- **🗄️ Records CRUD & Query** (/api/v1/records): Universal Multi-DocType Ingestion, Store AI, Query, Update, Delete
+- **📊 Dashboard & Analytics** (/api/v1/dashboard): Metrics, Multi-Window Recency Scores, Recalculate Score
+- **🎯 Scoring Goals** (/api/v1/goals): Setup Goals (10k, $3500, 25%), Get Goals
+- **📥 Multimodal Ingestion** (/api/v1/ingest): Text, Audio (Whisper), Image (Vision OCR), Direct Insert
+- **💬 Agentic Chatbot** (/api/v1/chat): Message, History, Clear
+
+
+
 **Base URL:**
 
 ```text

@@ -1,20 +1,18 @@
 import json
-import httpx
 from typing import Optional, Dict, Any, List
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
-from app.core.config import settings
+
+from app.services.frappe_client import FrappeClient
+from app.services.frappe_dispatch import build_store_ai_payload
 
 
-def _get_headers(config: RunnableConfig) -> Dict[str, str]:
+def _get_token(config: RunnableConfig) -> str:
     """Retrieves caller's Frappe token from LangGraph runtime config context."""
     token = config.get("configurable", {}).get("frappe_token")
     if not token:
         raise ValueError("Authentication token missing from session context.")
-    return {
-        "Authorization": token,
-        "Content-Type": "application/json"
-    }
+    return token
 
 
 @tool
@@ -23,65 +21,57 @@ async def get_user_records_tool(
     from_date: Optional[str] = None, 
     to_date: Optional[str] = None, 
     limit: int = 20, 
+    offset: int = 0,
+    order_by: Optional[str] = None,
     config: RunnableConfig = None
 ) -> str:
     """
-    Fetch user records from Frappe for question-answering or viewing history.
+    Fetch user records from Frappe for question-answering, auditing, or viewing history.
     doctype: Allowed DocTypes: 'Health Daily Record', 'Health Activity', 'Financial Transaction', 
              'Financial Snapshot', 'Social Activity', 'Subjective Wellbeing Checkin'.
     from_date / to_date: Optional YYYY-MM-DD string filters.
+    limit: Number of records to retrieve (default 20, max 200).
+    offset: Pagination offset.
+    order_by: e.g. 'transaction_date desc', 'record_date desc', 'creation desc'.
     """
-    headers = _get_headers(config)
-    url = f"{settings.FRAPPE_BASE_URL}/api/method/well_pro.well_pro_app.api.get_user_records"
-    params = {"doctype": doctype, "limit": limit}
-    if from_date:
-        params["from_date"] = from_date
-    if to_date:
-        params["to_date"] = to_date
-
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        res = await client.get(url, headers=headers, params=params)
-        if res.status_code == 200:
-            data = res.json().get("message", {}).get("data", [])
-            return json.dumps(data, indent=2)
-        return f"Error fetching records ({res.status_code}): {res.text}"
+    token = _get_token(config)
+    try:
+        data = await FrappeClient.get_user_records(
+            doctype=doctype,
+            token=token,
+            limit=limit,
+            offset=offset,
+            order_by=order_by,
+            from_date=from_date,
+            to_date=to_date,
+        )
+        return json.dumps(data, indent=2)
+    except Exception as exc:
+        return f"Error fetching records: {str(exc)}"
 
 
 @tool
 async def insert_user_records_tool(
     records: List[Dict[str, Any]], 
-    atomic: bool = True, 
     config: RunnableConfig = None
 ) -> str:
     """
-    Insert single or batch records into Frappe using the store_ai_record batch endpoint.
-    records: List of dicts, each with keys 'domain' ('health', 'health_activity', 'financial', 'social', 'wellbeing')
-             and 'record_data' dict conforming to the schema.
+    Insert single or batch records into Frappe using the v2.0.0 store_ai_record endpoint.
+    records: List of dicts, each with keys 'domain' ('health', 'health_activity', 'activity', 'financial', 'financial_snapshot', 'social', 'wellbeing')
+             and 'record_data' dict conforming to the DocType schema.
     Example:
     records = [
-      {"domain": "financial", "record_data": {"transaction_type": "Expense", "amount": 12.0, ...}},
-      {"domain": "health_activity", "record_data": {"activity_type": "Running", "duration_minutes": 30, ...}}
+      {"domain": "financial", "record_data": {"transaction_type": "Expense", "amount": 12.0, "category": "Lunch"}},
+      {"domain": "health", "record_data": {"record_date": "2026-10-30", "steps": 8500, "sleep_hours": 7.5}}
     ]
     """
-    headers = _get_headers(config)
-    url = f"{settings.FRAPPE_BASE_URL}/api/method/well_pro.well_pro_app.api.store_ai_record"
-    
-    if len(records) == 1 and not atomic:
-        payload = {
-            "domain": records[0].get("domain"),
-            "record_data": records[0].get("record_data", {})
-        }
-    else:
-        payload = {
-            "atomic": atomic,
-            "records": records
-        }
-
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        res = await client.post(url, headers=headers, json=payload)
-        if res.status_code == 200:
-            return json.dumps(res.json().get("message", {}), indent=2)
-        return f"Error inserting record(s) ({res.status_code}): {res.text}"
+    token = _get_token(config)
+    try:
+        payload = build_store_ai_payload(records)
+        res = await FrappeClient.store_ai_record(payload=payload, token=token)
+        return json.dumps(res, indent=2)
+    except Exception as exc:
+        return f"Error inserting record(s): {str(exc)}"
 
 
 @tool
@@ -94,22 +84,20 @@ async def update_user_record_tool(
     """
     Update an existing Frappe record by document name/ID.
     doctype: Target DocType name (e.g. 'Health Daily Record', 'Financial Transaction')
-    name: Document ID (e.g. 'FIN-TRA-2026-10-00001')
+    name: Document ID (e.g. 'FT-00109' or 'HDR-00042')
     update_data: Dictionary of fields to update.
     """
-    headers = _get_headers(config)
-    url = f"{settings.FRAPPE_BASE_URL}/api/method/well_pro.well_pro_app.api.update_record"
-    payload = {
-        "doctype": doctype,
-        "name": name,
-        "update_data": update_data
-    }
-
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        res = await client.post(url, headers=headers, json=payload)
-        if res.status_code == 200:
-            return json.dumps(res.json().get("message", {}), indent=2)
-        return f"Error updating record ({res.status_code}): {res.text}"
+    token = _get_token(config)
+    try:
+        res = await FrappeClient.update_record(
+            doctype=doctype,
+            name=name,
+            update_data=update_data,
+            token=token,
+        )
+        return json.dumps(res, indent=2)
+    except Exception as exc:
+        return f"Error updating record: {str(exc)}"
 
 
 @tool
@@ -120,34 +108,91 @@ async def delete_user_record_tool(
 ) -> str:
     """
     Delete a user record from Frappe by document name/ID.
+    doctype: Target DocType name.
+    name: Target document ID (e.g. 'FT-00109').
     """
-    headers = _get_headers(config)
-    url = f"{settings.FRAPPE_BASE_URL}/api/method/well_pro.well_pro_app.api.delete_record"
-    payload = {
-        "doctype": doctype,
-        "name": name
-    }
-
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        res = await client.post(url, headers=headers, json=payload)
-        if res.status_code == 200:
-            return json.dumps(res.json().get("message", {}), indent=2)
-        return f"Error deleting record ({res.status_code}): {res.text}"
+    token = _get_token(config)
+    try:
+        res = await FrappeClient.delete_record(
+            doctype=doctype,
+            name=name,
+            token=token,
+        )
+        return json.dumps(res, indent=2)
+    except Exception as exc:
+        return f"Error deleting record: {str(exc)}"
 
 
 @tool
-async def get_dashboard_metrics_tool(as_of_date: Optional[str] = None, config: RunnableConfig = None) -> str:
+async def get_dashboard_metrics_tool(
+    days: int = 30,
+    as_of_date: Optional[str] = None, 
+    config: RunnableConfig = None
+) -> str:
     """
-    Get user's complete wellbeing dashboard (scores, 7/30/90-day trends, confidences across health, financial, social, overall).
+    Get user's complete wellbeing dashboard:
+    - Current scores (health, financial, social, overall, confidence).
+    - Multi-window rolling summaries (7-day, 30-day, 90-day recency-weighted scores and trends).
+    - Historical trend timeline.
+    - Recent feeds across health, financial transactions, social logs, and checkins.
     """
-    headers = _get_headers(config)
-    url = f"{settings.FRAPPE_BASE_URL}/api/method/well_pro.well_pro_app.api.get_dashboard"
-    params = {}
-    if as_of_date:
-        params["as_of_date"] = as_of_date
+    token = _get_token(config)
+    try:
+        res = await FrappeClient.get_dashboard_metrics(
+            token=token,
+            days=days,
+            as_of_date=as_of_date,
+        )
+        return json.dumps(res, indent=2)
+    except Exception as exc:
+        return f"Error fetching dashboard metrics: {str(exc)}"
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        res = await client.get(url, headers=headers, params=params)
-        if res.status_code == 200:
-            return json.dumps(res.json().get("message", {}).get("data", {}), indent=2)
-        return f"Error fetching dashboard ({res.status_code}): {res.text}"
+
+@tool
+async def recalculate_score_tool(
+    date: Optional[str] = None,
+    config: RunnableConfig = None
+) -> str:
+    """
+    Explicitly triggers recalculation of wellbeing daily scores for a specific date (YYYY-MM-DD).
+    If date is omitted, defaults to today.
+    """
+    token = _get_token(config)
+    try:
+        res = await FrappeClient.recalculate_score(date=date, token=token)
+        return json.dumps(res, indent=2)
+    except Exception as exc:
+        return f"Error recalculating score: {str(exc)}"
+
+
+@tool
+async def setup_scoring_goals_tool(
+    goals: Dict[str, Any],
+    recalculate: bool = True,
+    config: RunnableConfig = None
+) -> str:
+    """
+    Configure personal wellbeing scoring targets in Frappe.
+    Accepts human-friendly string values:
+    e.g. {"steps": "10k", "financial_budget": "$3,000", "savings_rate": "20%", "water": "3L", "exercise_minutes": 45}
+    recalculate: Whether to automatically recalculate current scores with the new goals.
+    """
+    token = _get_token(config)
+    try:
+        res = await FrappeClient.setup_scoring_goals(goals=goals, recalculate=recalculate, token=token)
+        return json.dumps(res, indent=2)
+    except Exception as exc:
+        return f"Error setting up scoring goals: {str(exc)}"
+
+
+@tool
+async def get_scoring_goals_tool(config: RunnableConfig = None) -> str:
+    """
+    Retrieve user's active scoring goals merged with system baseline targets.
+    """
+    token = _get_token(config)
+    try:
+        res = await FrappeClient.get_scoring_goals(token=token)
+        return json.dumps(res, indent=2)
+    except Exception as exc:
+        return f"Error retrieving scoring goals: {str(exc)}"

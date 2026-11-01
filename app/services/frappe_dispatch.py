@@ -1,89 +1,95 @@
-import asyncio
 from typing import Any, Dict, List
-import httpx
-from app.core.config import settings
+from collections import defaultdict
+from app.services.frappe_client import FrappeClient
+
+
+# Normalized domain mapping according to Frappe v2.0.0 specification
+DOMAIN_MAPPING = {
+    "health": "health",
+    "health_daily_record": "health",
+    "health daily record": "health",
+    "activity": "activity",
+    "health_activity": "activity",
+    "health activity": "activity",
+    "financial": "financial",
+    "financial_transaction": "financial",
+    "financial transaction": "financial",
+    "financial_snapshot": "financial_snapshot",
+    "financial snapshot": "financial_snapshot",
+    "social": "social",
+    "social_activity": "social",
+    "social activity": "social",
+    "wellbeing": "wellbeing",
+    "subjective_wellbeing_checkin": "wellbeing",
+    "subjective wellbeing checkin": "wellbeing",
+}
+
+
+def build_store_ai_payload(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Groups extracted records by canonical domain key according to Frappe v2.0.0 store_ai_record format:
+    {
+      "health": {...},
+      "financial": [{...}, {...}],
+      "social": {...},
+      "wellbeing": {...},
+      "activity": {...}
+    }
+    """
+    domain_groups = defaultdict(list)
+
+    for rec in records:
+        raw_domain = (rec.get("domain") or rec.get("doctype") or "health").lower().strip()
+        canonical_domain = DOMAIN_MAPPING.get(raw_domain, raw_domain)
+        record_data = rec.get("record_data", rec)
+        domain_groups[canonical_domain].append(record_data)
+
+    payload: Dict[str, Any] = {}
+    for domain, items in domain_groups.items():
+        # DocTypes that naturally support multiple entries per day (transactions, activities, social)
+        if len(items) == 1:
+            # If single item, can be sent as object directly, or list if transactions
+            if domain in ("financial", "activity"):
+                payload[domain] = items
+            else:
+                payload[domain] = items[0]
+        else:
+            payload[domain] = items
+
+    return payload
+
 
 async def dispatch_records_to_frappe(
     records: List[Dict[str, Any]],
     raw_token: str
 ) -> List[Dict[str, Any]]:
     """
-    Dispatches extracted domain records to the Frappe RPC endpoint.
-    - If multiple records exist, sends a single batch payload using `"atomic": True`.
-    - If a single record exists, sends the single-extraction payload.
+    Dispatches extracted domain records to Frappe v2.0.0 store_ai_record endpoint.
+    Returns structured results including created items and recalculated scores.
     """
     if not records:
         return []
 
-    frappe_endpoint = f"{settings.FRAPPE_BASE_URL}/api/method/well_pro.well_pro_app.api.store_ai_record"
-    headers = {
-        "Authorization": raw_token,
-        "Content-Type": "application/json",
-    }
+    payload = build_store_ai_payload(records)
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            # Case A: Batch Extraction (Multiple Records)
-            if len(records) > 1:
-                batch_records = []
-                for rec in records:
-                    batch_records.append({
-                        "domain": rec.get("domain"),
-                        "record_data": rec.get("record_data", {})
-                    })
+    try:
+        frappe_res = await FrappeClient.store_ai_record(payload=payload, token=raw_token)
 
-                payload = {
-                    "atomic": True,
-                    "records": batch_records
-                }
+        # In Frappe standard envelope, response is inside 'message' or directly returned
+        data = frappe_res.get("data") if isinstance(frappe_res, dict) and "data" in frappe_res else frappe_res
+        msg = frappe_res.get("message", "Records processed successfully") if isinstance(frappe_res, dict) else "Success"
 
-                response = await client.post(frappe_endpoint, json=payload, headers=headers)
-                if response.status_code == 200:
-                    res_json = response.json()
-                    msg_wrapper = res_json.get("message", {})
-                    return [{
-                        "type": "batch",
-                        "status": "success",
-                        "message": msg_wrapper.get("message", "Batch records inserted successfully"),
-                        "data": msg_wrapper.get("data")
-                    }]
-                else:
-                    return [{
-                        "type": "batch",
-                        "status": "error",
-                        "status_code": response.status_code,
-                        "error_detail": response.text
-                    }]
+        return [{
+            "type": "store_ai_record",
+            "status": "success",
+            "message": msg,
+            "data": data,
+            "recalculated_scores": data.get("recalculated_scores") if isinstance(data, dict) else None,
+        }]
 
-            # Case B: Single Extraction (One Record)
-            else:
-                single_rec = records[0]
-                domain = single_rec.get("domain")
-                payload = {
-                    "domain": domain,
-                    "record_data": single_rec.get("record_data", {})
-                }
-
-                response = await client.post(frappe_endpoint, json=payload, headers=headers)
-                if response.status_code == 200:
-                    res_json = response.json()
-                    msg_wrapper = res_json.get("message", {})
-                    return [{
-                        "domain": domain,
-                        "status": "success",
-                        "message": msg_wrapper.get("message", "Record inserted successfully"),
-                        "data": msg_wrapper.get("data")
-                    }]
-                else:
-                    return [{
-                        "domain": domain,
-                        "status": "error",
-                        "status_code": response.status_code,
-                        "error_detail": response.text
-                    }]
-
-        except Exception as exc:
-            return [{
-                "status": "error",
-                "error_detail": str(exc)
-            }]
+    except Exception as exc:
+        return [{
+            "type": "store_ai_record",
+            "status": "error",
+            "error_detail": str(exc),
+        }]
